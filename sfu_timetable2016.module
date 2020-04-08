@@ -1,0 +1,470 @@
+<?php
+
+function _sfu_timetable2016($check_year = FALSE, $check_semester = FALSE) {
+	// подключение CSS и PHP-файлов
+	$path = drupal_get_path('module', 'sfu_timetable2016');
+	drupal_add_css("$path/sfu_timetable2016.css");
+	require("$path/lib.inc.php");
+	require("$path/parser.inc.php");
+	require("$path/theme.inc.php");
+
+	// показать расписание определённой группы
+	if ($_GET['group'] != '') {
+		$output .= _sfu_timetable2016_theme_group($_GET['group'], $check_year, $check_semester);
+	}
+	// расписание преподавателя
+	elseif ($_GET['teacher'] != '') {
+		$output .= _sfu_timetable2016_theme_teacher($_GET['teacher'], $check_year, $check_semester);
+	}
+	// занятость аудитории
+	// 2018-10-10: вкладка скрыта на некоторое время...
+	elseif ($_GET['place'] != '' && false) {
+		$output .= _sfu_timetable2016_theme_place($_GET['place'], $check_year, $check_semester);
+	}
+	// список групп
+	else {
+		$output .= _sfu_timetable2016_theme_listing();
+	}
+	return $output;
+}
+
+// актуализация расписаний
+function sfu_timetable2016_cron() {
+	_sfu_timetable2016_update_all();
+}
+
+// распарсить новое расписание; $renew — перепарсить и старые тоже (предварительная очистка БД)
+function _sfu_timetable2016_update_all($renew = FALSE, $changed_nid = FALSE) {
+	$path = drupal_get_path('module', 'sfu_timetable2016');
+	require_once("$path/lib.inc.php");
+	require_once("$path/parser.inc.php");
+
+	// полная очистка
+	if ($renew) {
+		db_query("DELETE FROM timetable_lenta");
+		db_query("DELETE FROM timetable");
+	}
+
+	// удаляем недораспарсенные расписания
+	$lost = db_query("SELECT tid, filepath FROM timetable WHERE ready=0");
+	while ($lost = db_fetch_object($timetable)) {
+		_sfu_timetable2016_log("Удаление недоразобранных расписаний: $lost->filepath", TRUE);
+		_sfu_timetable2016_delete_timetable($lost->tid);
+	}
+
+	// загрузка расписаний из БД и разбор их
+	$files = array();
+	$db_timetables = db_query("SELECT n.title department, c.field_timetable_institute_value institute, c.nid, f1.filepath course1, f2.filepath course2, f3.filepath course3, f4.filepath course4, f5.filepath course5, f6.filepath course6, m1.filepath course7, m2.filepath course8, m3.filepath course9 FROM content_type_timetable c JOIN node n ON c.vid=n.vid LEFT JOIN files f1 ON c.field_timetable_course1_fid=f1.fid LEFT JOIN files f2 ON c.field_timetable_course2_fid=f2.fid LEFT JOIN files f3 ON c.field_timetable_course3_fid=f3.fid LEFT JOIN files f4 ON c.field_timetable_course4_fid=f4.fid LEFT JOIN files f5 ON c.field_timetable_course5_fid=f5.fid LEFT JOIN files f6 ON c.field_timetable_course6_fid=f6.fid LEFT JOIN files m1 ON c.field_timetable_magisters1_fid=m1.fid LEFT JOIN files m2 ON c.field_timetable_magisters2_fid=m2.fid LEFT JOIN files m3 ON c.field_timetable_magisters3_fid=m3.fid WHERE n.status=1 AND n.type='timetable' ORDER BY institute");
+	while ($timetable = db_fetch_object($db_timetables)) {
+		for ($course = 1; $course <= 9; $course++) {
+			if ($filepath = $timetable->{"course$course"}) {
+				if (memory_get_usage() > 170 * 1000 * 1000) {_sfu_timetable2016_log("Большой расход памяти, остановка разбора"); return;} // выход, если близки к пределу по памяти
+				$files[$filepath][filemtime($filepath)] = TRUE;
+				if ($changed_nid && $changed_nid != $timetable->nid) continue;
+				if (!_sfu_timetable2016_is_parsed($filepath)) {
+					_sfu_timetable2016_log_show("Начат разбор файла: $filepath");
+					$department = strstr(drupal_strtolower($timetable->department), 'институт') === FALSE ? $timetable->department : '';
+					if (_sfu_timetable2016_parse2db($timetable->institute, $department, $timetable->nid, $course, $filepath)) {
+						_sfu_timetable2016_log_show("Успешно разобран файл: $filepath");
+					}
+					else {
+						_sfu_timetable2016_log_show("Ошибка при разборе файла: $filepath", TRUE);
+					}
+				}
+			}
+		}
+	}
+	_sfu_timetable2016_log('Все расписания разобраны');
+
+	// удаляем из БД расписания, которых уже нет по какой-то причине
+	$timetables = db_query("SELECT tid, filepath, filemtime FROM timetable");
+	while ($timetable = db_fetch_object($timetables)) {
+		if (!$files[$timetable->filepath][$timetable->filemtime]) {
+			_sfu_timetable2016_log("Удаление потерянного расписания: $timetable->filepath", TRUE);
+			_sfu_timetable2016_delete_timetable($timetable->tid);
+		}
+	}
+}
+
+// репарсинг файлов про изменениях
+function sfu_timetable2016_nodeapi(&$node, $op, $a3 = NULL, $a4 = NULL) {
+	if ($node->type == 'timetable' && ($op == 'insert' || $op == 'update' || $op == 'delete')) {
+		$path = drupal_get_path('module', 'sfu_timetable2016');
+		require_once("$path/lib.inc.php");
+		require_once("$path/parser.inc.php");
+		_sfu_timetable2016_delete_timetables_by_nid($node->nid);
+		if ($op != 'delete') _sfu_timetable2016_update_all(FALSE, $node->nid);
+	}
+}
+
+// autocomplete для поисковых форм
+function sfu_timetable2016_menu($may_cache) {
+	if ($may_cache) {
+		$items[] = array(
+			'path' => 'timetable/groups/autocomplete',
+			'callback' => '_sfu_timetable2016_groups_autocomplete',
+			'access' => user_access('access content'),
+			'type' => MENU_CALLBACK
+		);
+		$items[] = array(
+			'path' => 'timetable/teachers/autocomplete',
+			'callback' => '_sfu_timetable2016_teachers_autocomplete',
+			'access' => user_access('access content'),
+			'type' => MENU_CALLBACK
+		);
+		$items[] = array(
+			'path' => 'timetable/places/autocomplete',
+			'callback' => '_sfu_timetable2016_places_autocomplete',
+			'access' => user_access('access content'),
+			'type' => MENU_CALLBACK
+		);
+
+		$items[] = array(
+			'path' => 'api/timetable/export',
+			'callback' => '_sfu_timetable2016_export_json',
+			'access' => user_access('access content'),
+			'type' => MENU_CALLBACK
+		);
+
+	    $items[] = array(
+	    	'path' => 'api/timetable/groups',
+	    	'callback' => '_sfu_timetable2016_groups_json',
+	    	'access' => user_access('access content'),
+	    	'type' => MENU_CALLBACK
+	    );
+
+	    $items[] = array(
+	    	'path' => 'api/timetable/teachers',
+	    	'callback' => '_sfu_timetable2016_teachers_json',
+	    	'access' => user_access('access content'),
+	    	'type' => MENU_CALLBACK
+	    );
+
+	    $items[] = array(
+	    	'path' => 'api/timetable/schedule',
+	    	'callback' => '_sfu_timetable2016_schedule_json',
+	    	'access' => user_access('access content'),
+	    	'type' => MENU_CALLBACK
+	    );
+
+	    $items[] = array(
+	    	'path' => 'api/timetable/get',
+	    	'callback' => '_sfu_timetable2016_get_json',
+	    	'access' => user_access('access content'),
+	    	'type' => MENU_CALLBACK
+	    );
+
+	    // на странице с расписанием аспирантуры тоже нужно выводить какая неделя, поэтому добавим такой сервис
+	    $items[] = array(
+	    	'path' => 'api/timetable/week',
+	    	'callback' => '_sfu_timetable2016_week_json',
+	    	'access' => user_access('access content'),
+	    	'type' => MENU_CALLBACK
+	    );
+
+	}
+
+	return $items;
+}
+
+function _sfu_timetable2016_die_json($data) {
+	init_theme();
+	header('Content-Type: application/json; charset=utf-8');
+	header('Access-Control-Allow-Origin: *');
+	echo json_encode($data);
+	exit(0);
+}
+
+function _sfu_timetable2016_export_json() {
+	$days = filter_input(INPUT_GET, 'days', FILTER_VALIDATE_INT, array(
+		'options' => array(
+			'min_range' => 0,
+			'max_range' => 30,
+		),
+	));
+
+	if ($days === false || $days === null)
+		die(json_encode(array('error' => 'Bad value: "days"')));
+
+	$path = drupal_get_path('module', 'sfu_timetable2016');
+	require($path . '/lib.inc.php');
+
+	header('Content-Type: application/json; charset=utf-8');
+
+	$query = db_query('SELECT `group`, `tid`, `institute` FROM timetable WHERE year = %d ORDER BY `group`', date('Y') - (date('m') < 9));
+
+	while ($timetable = db_fetch_object($query))
+		$groups[$timetable->tid] = array(
+			'name' => $timetable->group,
+			'institute' => _sfu_timetable2016_institute($timetable->institute)
+		);
+
+	$tids = array_keys($groups);
+	$data = array();
+
+	for ($i = 0; $i <= $days; $i++) {
+		$timestamp = time() + $i * 24 * 60 * 60;
+		$weekday = date('N', $timestamp);
+		$week = _sfu_timetable2016_week_parity(false, $timestamp);
+		$query = db_query('SELECT * FROM timetable_lenta WHERE tid IN (%s) AND week = %d AND day = %d', implode(', ', $tids), $week, $weekday);
+
+		while ($subject = db_fetch_object($query)) {
+			list($time_start, $time_end) = explode('-', $subject->time);
+
+			$group = $groups[$subject->tid]['name'];
+			$subgroup = '';
+
+			$matches = null;
+
+			if (preg_match('/\((подгруппа\s)?(\d)(\sподгруппа)?\)/', $group, $matches))
+				$subgroup = $matches[2];
+
+			$data[] = array(
+				'date' => date('Y.m.d', $timestamp),
+				'time_start' => $time_start,
+				'time_end' => $time_end,
+				'department' => $groups[$subject->tid]['institute'],
+				'group' => $group,
+				'subgroup' => $subgroup,
+				'discipline' => $subject->subject,
+				'type' => $subject->type,
+				'lecturer' => $subject->teacher,
+				'classroom' => $subject->place,
+			);
+		}
+	}
+
+	_sfu_timetable2016_die_json($data);
+}
+
+function _sfu_timetable2016_groups_json() {
+	$path = drupal_get_path('module', 'sfu_timetable2016');
+	require($path . '/lib.inc.php');
+
+	$query = db_query('SELECT `group`, `institute` FROM timetable WHERE year = %d ORDER BY `group`', date('Y') - (date('m') < 9));
+	$groups = array();
+
+	while ($timetable = db_fetch_object($query)) {
+		$groups[] = array(
+			'name' => $timetable->group,
+			'institute' => _sfu_timetable2016_institute($timetable->institute)
+		);
+	}
+
+	_sfu_timetable2016_die_json($groups);
+}
+
+function _sfu_timetable2016_teachers_json() {
+	$path = drupal_get_path('module', 'sfu_timetable2016');
+	require($path . '/lib.inc.php');
+
+	$query = db_query('SELECT `teacher` FROM timetable_lenta GROUP BY `teacher` ORDER BY `teacher`');
+	$teachers = array();
+
+	while ($row = db_fetch_object($query)) {
+		if ($name = $row->teacher) {
+			$teachers[] = compact('name');
+		}
+	}
+
+	_sfu_timetable2016_die_json($teachers);
+}
+
+function _sfu_timetable2016_get_json() {
+	$target = filter_input(INPUT_GET, 'target', FILTER_SANITIZE_STRING);
+
+	if (empty($target)) {
+		_sfu_timetable2016_die_json(array(
+			'error' => 'Не заполнен обязательный параметр "target".'
+		));
+	}
+
+	$data = array(
+		'timetable' => array(),
+		'target' => $target,
+	);
+	$day = filter_input(INPUT_GET, 'day', FILTER_VALIDATE_INT, array(
+		'options' => array(
+			'min_range' => 1,
+			'max_range' => 7,
+		),
+	));
+
+	$week = filter_input(INPUT_GET, 'week', FILTER_VALIDATE_INT, array(
+		'options' => array(
+			'min_range' => 1,
+			'max_range' => 2,
+		)
+	));
+
+
+	$clauses = array();
+
+	if ($week) {
+		$clauses[] = sprintf('week = %d', $week);
+		$data['week'] = $week;
+	}
+
+	if ($day) {
+		$clauses[] = sprintf('day = %d', $day);
+		$data['day'] = $day;
+	}
+
+	if ($group = db_fetch_object(db_query("SELECT * FROM timetable WHERE `group` = '%s'", $target))) {
+		$clauses[] = sprintf('tid = %d', $group->tid);
+		$data['type'] = 'group';
+	}
+	else {
+		$clauses[] = sprintf("teacher = '%s'", $target);
+		$data['type'] = 'teacher';
+	}
+
+	$query = db_query('SELECT * FROM timetable_lenta LEFT JOIN timetable USING(tid) WHERE ' . implode(' AND ', $clauses) . ' ORDER BY day, time, week, subject, lid');
+
+	$data['timetable_raw'] = array();
+	
+	while ($timetable = db_fetch_object($query)) {
+		$data['timetable_raw'][] = array(
+			'day' => $timetable->day,
+			'week' => $timetable->week,
+			'time' => $timetable->time,
+			'subject' => $timetable->subject,
+			'type' => $timetable->type,
+			'teacher' => $timetable->teacher,
+			'place' => $timetable->place,
+			'group' => $timetable->group
+		);
+	}
+
+	$prev_item = array();
+
+	foreach ($data['timetable_raw'] as $item) {
+		$group = $item['group'];
+		unset($item['group']);
+
+
+		if (empty($prev_item) || $item !== $prev_item) {
+			$prev_item = $item;
+			$item['groups'] = array($group);
+			$data['timetable'][] = $item;
+		}
+		else {
+			$data['timetable'][count($data['timetable']) - 1]['groups'][] = $group;
+		}
+	}
+
+	unset($data['timetable_raw']);
+
+	foreach ($data['timetable'] as &$row) {
+		switch ($data['type']) {
+			case 'group':
+				unset($row['groups']);
+				break;
+
+			case 'teacher':
+				unset($row['teacher']);
+				break;
+		}
+	}
+
+	unset($row);
+
+	_sfu_timetable2016_die_json($data);
+}
+
+
+function _sfu_timetable2016_week_json() {
+	$path = drupal_get_path('module', 'sfu_timetable2016');
+	require($path . '/lib.inc.php');
+	$data['week'] = _sfu_timetable2016_week_parity(false); 
+	header('Content-Type: application/json; charset=utf-8');
+	header('Access-Control-Allow-Origin: *');
+	header('Access-Control-Allow-Headers:  Origin, X-Requested-With, Content-Type, Accept');
+	echo json_encode($data);
+	exit(0);
+}
+
+function _sfu_timetable2016_autocomplete_helper($table, $field, $string = '') {
+	$matches = array();
+	if ($string) {
+		$where = $table == 'timetable' ? ' AND ready=1' : '';
+		$values = db_query_range("SELECT DISTINCT `${field}` value FROM $table WHERE LOWER(`${field}`) LIKE LOWER('%%%s%%') $where", $string, 0, 12);
+		while ($value = db_fetch_object($values)) {
+			$matches[$value->value] = check_plain($value->value);
+		}
+	}
+	print drupal_to_js($matches);
+	exit();
+}
+function _sfu_timetable2016_groups_autocomplete($string = '') {
+	_sfu_timetable2016_autocomplete_helper('timetable', 'group', $string);
+}
+function _sfu_timetable2016_teachers_autocomplete($string = '') {
+	_sfu_timetable2016_autocomplete_helper('timetable_lenta', 'teacher', $string);
+}
+function _sfu_timetable2016_places_autocomplete($string = '') {
+	_sfu_timetable2016_autocomplete_helper('timetable_lenta', 'place', $string);
+}
+
+/*
+CREATE TABLE timetable (
+	tid INT(10) PRIMARY KEY AUTO_INCREMENT,
+	institute INT(3) NOT NULL COMMENT '1 ВИИ, 2 ГИ, 3 ИСИ, 4 ИАиД, 5 ИГДГиГ, 6 ИИФиРЭ, 7 ИКИТ, 8 ИМиФИ, 9 ИНиГ, 10 ИППС, 11 ИУБПЭ, 12 ИФКСиТ, 13 ИФиЯК, 14 ИФБиБТ, 15 ИЦМиМ, 16 ИЭУиП, 17 ПИ, 18 ТЭИ, 19 ЮИ',
+	department VARCHAR(200) COMMENT 'факультет, отделение и т. п.',
+	nid INT(10) COMMENT 'идентификатор ноды откуда взято расписание',
+	course INT(2) NOT NULL COMMENT '1..6 — бакалавры, специалисты, 7..9 — магистры',
+	`group` VARCHAR(100) NOT NULL,
+	year INT(4) NOT NULL COMMENT 'начальный год семестра',
+	semester INT(1) NOT NULL COMMENT '1 осенний, 2 весенний',
+	filepath VARCHAR(200) NOT NULL,
+	filemtime INT(11) NOT NULL,
+	ready INT(1) NOT NULL COMMENT '0 не заполнено до конца, требуется переобработка исходного файла; 1 полностью заполнено, можно использовать без переобработки Файла; -1 ошибка, требуется исправление файла или алгоритма обработки'
+);
+
+CREATE INDEX timetable_institute_idx ON timetable (institute, department, course);
+CREATE UNIQUE INDEX timetable_group_idx ON timetable (`group`);
+
+CREATE TABLE timetable_building (
+	bid INT(3) PRIMARY KEY,
+	address VARCHAR(100) NOT NULL COMMENT 'например: пр. Свободный, 82А',
+	map_key VARCHAR(20) COMMENT 'номер корпуса на карте кампуса при наличии, например: k24'
+);
+
+CREATE TABLE timetable_lenta (
+	lid INT(10) PRIMARY KEY AUTO_INCREMENT,
+	tid INT(10) NOT NULL COMMENT 'идентификатор расписания из таблицы timetable',
+	week INT(1) NOT NULL COMMENT '1 нечётная неделя, 2 чётная неделя',
+	day INT(2) NOT NULL COMMENT '1..7',
+	time VARCHAR(11) NOT NULL COMMENT '08:30-10:05 - обязательно с нулем в начале для сортировки',
+	subject VARCHAR(200) NOT NULL COMMENT 'например: Физика',
+	type VARCHAR(200) COMMENT 'лекция, практика, лабораторная работа и т. п.',
+	teacher VARCHAR(200) COMMENT 'например: Иванов И. И.',
+	place VARCHAR(200) COMMENT 'например: 33-10',
+	bid INT(3) COMMENT 'номер корпуса из таблицы timetable_building'
+);
+
+# может быть на будущее:
+
+CREATE TABLE timetable_teacher (
+	tid INT(10) PRIMARY KEY AUTO_INCREMENT,
+	fio VARCHAR(200) NOT NULL COMMENT 'Например: Иванов И. И.'
+);
+CREATE TABLE timetable_lenta2teacher (
+	lid INT(10) NOT NULL,
+	tid INT(10) NOT NULL,
+	PRIMARY KEY (lid, tid)
+);
+CREATE INDEX timetable_lenta2teacher_teacher_idx (tid);
+
+CREATE timetable_place (
+	pid INT(10) PRIMARY KEY AUTO_INCREMENT,
+	place VARCHAR(200) NOT NULL COMMENT 'Например: 33-10'
+);
+CREATE TABLE timetable_lenta2place (
+	lid INT(10) NOT NULL,
+	pid INT(10) NOT NULL,
+	PRIMARY KEY (tid, lid)
+);
+CREATE INDEX timetable_lenta2place_place_idx (pid);
+
+*/

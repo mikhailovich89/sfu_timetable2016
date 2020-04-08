@@ -1,0 +1,23 @@
+#timetable-groups-search-form input, #timetable-groups-search-form div,
+#timetable-teachers-search-form input, #timetable-teachers-search-form div,
+#timetable-places-search-form input, #timetable-places-search-form div
+{
+	display: inline;
+}
+
+#timetable-groups-search-form, #timetable-teachers-search-form, #timetable-places-search-form {
+	margin-bottom: 1em;
+}
+
+.timetable .conflict, .timetable .conflict abbr {
+	color: red !important;
+	border-color: red !important;
+}
+
+.timetable em a {
+	color:#5f8a96 !important;
+}
+
+.timetable-groups .collapsed-block .collapsed-content {
+	font-style: normal;
+}
